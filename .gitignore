@@ -1,0 +1,65 @@
+# --- C++ & CMake 构建产物 ---
+build/
+bin/
+lib/
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.lib
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+*.cmake
+compile_commands.json
+
+# --- 项目生成的可执行文件 (根据你的CMakeLists) ---
+lidar_extractor
+optimizer
+
+# --- Python 缓存与环境 ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+
+# --- 关键：数据文件 (不要上传数据集！) ---
+# 忽略 data 文件夹下的所有内容，因为 KITTI 数据集和生成的特征文件通常很大
+data/
+# 如果你想保留 data 目录结构但忽略内容，可以取消下面这行的注释，并创建 .gitkeep
+# !data/.gitkeep
+
+# --- 关键：模型权重文件 (不要上传大模型！) ---
+# SAM 的权重文件通常有 2GB+，Github 限制单文件 100MB
+checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# --- 标定结果输出 ---
+# 忽略结果图片和生成的文本，除非你想把它们作为示例上传
+visual_result.png
+result/
+Calib_Result/
+*.log
+
+# --- IDE 与 系统文件 ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# --- 特殊情况：保留必要的脚本 ---
+# 确保脚本文件不被意外忽略（虽然上面的规则通常不会忽略 .sh 和 .py）
+!*.sh
+!*.py
+!CMakeLists.txt
