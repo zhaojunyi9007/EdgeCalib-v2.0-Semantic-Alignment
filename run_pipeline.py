@@ -12,6 +12,9 @@ import subprocess
 import argparse
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 class EdgeCalibPipeline:
     def __init__(self, config_path="config.yaml"):
         """初始化标定流程"""
@@ -29,6 +32,34 @@ class EdgeCalibPipeline:
         print(f"帧ID列表: {self.frame_ids}")
         print(f"输出目录: {self.config['data']['result_dir']}")
         print("=" * 40)
+
+    def _load_velo_to_cam_extrinsic(self):
+        """从calib_velo_to_cam.txt加载外参，并转换为angle-axis"""
+        calib_path = self.config["data"].get("velo_to_cam_file", "")
+        if not calib_path:
+            return None
+        if not os.path.exists(calib_path):
+            print(f"[Warning] LiDAR外参文件不存在: {calib_path}")
+            return None
+
+        r_vals = None
+        t_vals = None
+        with open(calib_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("R:"):
+                    r_vals = [float(x) for x in line.replace("R:", "").split()]
+                elif line.startswith("T:"):
+                    t_vals = [float(x) for x in line.replace("T:", "").split()]
+
+        if not r_vals or not t_vals or len(r_vals) != 9 or len(t_vals) != 3:
+            print(f"[Warning] LiDAR外参文件格式异常: {calib_path}")
+            return None
+
+        r_mat = np.array(r_vals, dtype=np.float64).reshape(3, 3)
+        t_vec = np.array(t_vals, dtype=np.float64)
+        r_vec, _ = cv2.Rodrigues(r_mat)
+        return r_vec.reshape(-1).tolist(), t_vec.reshape(-1).tolist()
     
     def _create_output_dirs(self):
         """创建输出目录结构"""
@@ -133,6 +164,10 @@ class EdgeCalibPipeline:
         
         init_r = self.config['calibration']['initial_extrinsic']['rotation']
         init_t = self.config['calibration']['initial_extrinsic']['translation']
+        velo_to_cam = self._load_velo_to_cam_extrinsic()
+        if velo_to_cam:
+            init_r, init_t = velo_to_cam
+            print("[Info] 使用calib_velo_to_cam.txt中的R/T作为初始外参")
         
         for frame_id in self.frame_ids:
             feature_base = os.path.join(lidar_dir, f"{frame_id:010d}")

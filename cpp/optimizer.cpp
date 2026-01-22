@@ -163,7 +163,14 @@ inline float GetDistanceValue(const cv::Mat& dist_map, int u, int v) {
     return 1.0f;
 }
 
-bool LoadCalib(const std::string& calib_file, Eigen::Matrix3d& K, Eigen::Matrix3d& R_rect) {
+//bool LoadCalib(const std::string& calib_file, Eigen::Matrix3d& K, Eigen::Matrix3d& R_rect) {
+bool LoadCalib(const std::string& calib_file,
+               Eigen::Matrix3d& K,
+               Eigen::Matrix3d& R_rect,
+               bool* used_default = nullptr) {
+    if (used_default) {
+        *used_default = false;
+    }
     if (!calib_file.empty() && IOUtils::LoadKittiCalib(calib_file, K)) {
         R_rect = Eigen::Matrix3d::Identity();
         return true;
@@ -172,7 +179,12 @@ bool LoadCalib(const std::string& calib_file, Eigen::Matrix3d& K, Eigen::Matrix3
     // 如果文件为空或加载失败，使用默认值
     std::cerr << "[Warning] Using default calibration parameters" << std::endl;
     K << 721.5, 0, 609.5, 0, 721.5, 172.8, 0, 0, 1;
-    R_rect = Eigen::Matrix3d::Identity(); 
+    //R_rect = Eigen::Matrix3d::Identity(); 
+    //return true;
+    R_rect = Eigen::Matrix3d::Identity();
+    if (used_default) {
+        *used_default = true;
+    }
     return true; 
 }
 
@@ -646,7 +658,9 @@ int main(int argc, char** argv) {
     // 加载内参
     Eigen::Matrix3d K; 
     Eigen::Matrix3d R_rect;
-    LoadCalib(calib_file, K, R_rect);
+    //LoadCalib(calib_file, K, R_rect);
+    bool calib_used_default = false;
+    LoadCalib(calib_file, K, R_rect, &calib_used_default);
 
     // ========================================
     // Debug信息输出
@@ -657,6 +671,15 @@ int main(int argc, char** argv) {
         Eigen::Matrix3d R_mat;
         ceres::AngleAxisToRotationMatrix(r_curr, R_mat.data());
         auto stats = CountProjectionStats(points, K, R_mat, t_vec, W, H);
+        const double in_bounds_ratio = stats.total > 0
+                                           ? static_cast<double>(stats.in_bounds) / static_cast<double>(stats.total)
+                                           : 0.0;
+        const double behind_ratio = stats.total > 0
+                                        ? static_cast<double>(stats.behind) / static_cast<double>(stats.total)
+                                        : 0.0;
+        const double out_of_bounds_ratio = stats.total > 0
+                                               ? static_cast<double>(stats.out_of_bounds) / static_cast<double>(stats.total)
+                                               : 0.0;
         std::cout << "[Debug] Projection stats (initial pose): total=" << stats.total
                   << ", labeled=" << stats.labeled
                   << ", unlabeled=" << stats.unlabeled
@@ -664,6 +687,46 @@ int main(int argc, char** argv) {
                   << ", behind=" << stats.behind
                   << ", out_of_bounds=" << stats.out_of_bounds
                   << std::endl;
+
+        std::cout << "[Debug] Projection ratios: in_bounds=" << in_bounds_ratio
+                  << ", behind=" << behind_ratio
+                  << ", out_of_bounds=" << out_of_bounds_ratio << std::endl;
+        if (stats.total > 0 && stats.in_bounds == 0) {
+            std::cout << "[Debug][Check] No points project inside the image. "
+                         "Initial extrinsic may be far off or intrinsics mismatch."
+                      << std::endl;
+        } else if (stats.total > 0 && in_bounds_ratio < 0.01) {
+            std::cout << "[Debug][Check] Very low in-bounds ratio (<1%). "
+                         "Initial extrinsic may be poor."
+                      << std::endl;
+        }
+        if (behind_ratio > 0.5) {
+            std::cout << "[Debug][Check] More than 50% of points are behind the camera. "
+                         "Check rotation direction or coordinate conventions."
+                      << std::endl;
+        }
+        if (out_of_bounds_ratio > 0.9) {
+            std::cout << "[Debug][Check] Most points are out of image bounds. "
+                         "Check intrinsics or image size."
+                      << std::endl;
+        }
+        double r_norm = std::sqrt(r_curr[0] * r_curr[0] + r_curr[1] * r_curr[1] + r_curr[2] * r_curr[2]);
+        double t_norm = std::sqrt(t_curr[0] * t_curr[0] + t_curr[1] * t_curr[1] + t_curr[2] * t_curr[2]);
+        if (r_norm > 1.0) {
+            std::cout << "[Debug][Check] Initial rotation angle-axis norm > 1 rad ("
+                      << r_norm << "). This may be a large initial rotation." << std::endl;
+        }
+        if (t_norm > 10.0) {
+            std::cout << "[Debug][Check] Initial translation norm > 10m ("
+                      << t_norm << "). This may be far from expected." << std::endl;
+        }
+        std::cout << "[Debug] Intrinsics K:\n" << K << std::endl;
+        if (calib_used_default) {
+            std::cout << "[Debug][Check] Using default intrinsics (calib file missing or load failed)."
+                      << std::endl;
+        } else {
+            std::cout << "[Debug] Loaded intrinsics from: " << calib_file << std::endl;
+        }
         if (!semantic_map.empty()) {
             std::cout << "[Debug] Semantic map max label: " << GetMaxLabel(semantic_map)
                       << ", type=" << semantic_map.type() << std::endl;
@@ -675,6 +738,16 @@ int main(int argc, char** argv) {
         if (!edge_weight.empty()) {
             std::cout << "[Debug] Edge weight type: " << edge_weight.type()
                       << ", size=" << edge_weight.cols << "x" << edge_weight.rows << std::endl;
+        }
+        if (!edge_dist.empty() && !semantic_map.empty()) {
+            if (edge_dist.cols != semantic_map.cols || edge_dist.rows != semantic_map.rows) {
+                std::cout << "[Debug][Check] Edge dist map size (" << edge_dist.cols << "x" << edge_dist.rows
+                          << ") differs from semantic map size (" << semantic_map.cols << "x"
+                          << semantic_map.rows << ")." << std::endl;
+            }
+        }
+        if ((W != 0 && H != 0) && (!edge_dist.empty() || !semantic_map.empty())) {
+            std::cout << "[Debug] Projection image size W/H: " << W << "x" << H << std::endl;
         }
     }
 
