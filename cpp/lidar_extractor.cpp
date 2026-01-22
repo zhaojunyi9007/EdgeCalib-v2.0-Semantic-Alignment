@@ -26,6 +26,7 @@
 // ========================================
 struct DepthEdgeResult {
     std::vector<bool> edge_flags;
+    std::vector<int> edge_types; // 0=Unknown, 1=Horizontal, 2=Vertical
     int edge_count = 0;
 };
 
@@ -76,13 +77,16 @@ DepthEdgeResult DetectDepthDiscontinuityEdges(
     }
 
     result.edge_flags.assign(cloud->size(), false);
+    result.edge_types.assign(cloud->size(), 0);
 
-    auto mark_edge = [&](int idx_a, int idx_b) {
+    auto mark_edge = [&](int idx_a, int idx_b, int edge_type) {
         if (idx_a >= 0) {
             result.edge_flags[static_cast<size_t>(idx_a)] = true;
+            result.edge_types[static_cast<size_t>(idx_a)] = std::max(result.edge_types[static_cast<size_t>(idx_a)], edge_type);
         }
         if (idx_b >= 0) {
             result.edge_flags[static_cast<size_t>(idx_b)] = true;
+            
         }
     };
 
@@ -101,7 +105,7 @@ DepthEdgeResult DetectDepthDiscontinuityEdges(
                 if (idx_right >= 0) {
                     float diff = std::abs(range_center - range_image[idx + 1]);
                     if (diff > depth_jump_threshold) {
-                        mark_edge(idx_center, idx_right);
+                        mark_edge(idx_center, idx_right, 1);
                     }
                 }
             }
@@ -111,7 +115,7 @@ DepthEdgeResult DetectDepthDiscontinuityEdges(
                 if (idx_down >= 0) {
                     float diff = std::abs(range_center - range_image[idx + width]);
                     if (diff > depth_jump_threshold) {
-                        mark_edge(idx_center, idx_down);
+                        mark_edge(idx_center, idx_down, 2);
                     }
                 }
             }
@@ -243,12 +247,6 @@ NDTFusionResult FuseMultiFrameNDT(
 // 新增：时空一致性加权 (README2.0 第二阶段 2.3)
 // 优化版本：使用NDT配准后的点云，预先构建KD-Tree
 // ========================================
-struct PointWithWeight {
-    pcl::PointXYZI point;
-    double weight;  // 0.0 (动态) ~ 1.0 (静态)
-    
-    PointWithWeight(const pcl::PointXYZI& p, double w) : point(p), weight(w) {}
-};
 
 struct RangeImageMapping {
     int rows = 64;
@@ -264,6 +262,28 @@ struct RangeImageData {
     std::vector<int> indices;
 };
 
+bool ProjectToRangeImage(const pcl::PointXYZI& p,
+                        const RangeImageMapping& cfg,
+                        int& row, int& col, float& range) {
+    range = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+    if (!std::isfinite(range) || range < 1e-3f) {
+        return false;
+    }
+
+    float az = std::atan2(p.y, p.x);
+    float el = std::atan2(p.z, std::sqrt(p.x * p.x + p.y * p.y));
+
+    float col_f = (az + static_cast<float>(M_PI)) / (2.0f * static_cast<float>(M_PI)) * cfg.cols;
+    float row_f = (el - cfg.min_el) / (cfg.max_el - cfg.min_el) * cfg.rows;
+
+    col = static_cast<int>(std::floor(col_f));
+    row = static_cast<int>(std::floor(row_f));
+    if (row < 0 || row >= cfg.rows || col < 0 || col >= cfg.cols) {
+        return false;
+    }
+    return true;
+}
+
 RangeImageData BuildRangeImage(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud,
                                const RangeImageMapping& cfg) {
     RangeImageData data;
@@ -274,7 +294,7 @@ RangeImageData BuildRangeImage(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud
 
     for (size_t i = 0; i < cloud->size(); ++i) {
         const auto& p = cloud->points[i];
-        float range = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+        /*float range = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
         if (!std::isfinite(range) || range < 1e-3f) continue;
 
         float az = std::atan2(p.y, p.x);
@@ -285,7 +305,14 @@ RangeImageData BuildRangeImage(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud
 
         int col = static_cast<int>(std::floor(col_f));
         int row = static_cast<int>(std::floor(row_f));
-        if (row < 0 || row >= cfg.rows || col < 0 || col >= cfg.cols) continue;
+        if (row < 0 || row >= cfg.rows || col < 0 || col >= cfg.cols) continue;*/
+
+        int row = 0;
+        int col = 0;
+        float range = 0.0f;
+        if (!ProjectToRangeImage(p, cfg, row, col, range)) {
+            continue;
+        }
 
         int idx = row * cfg.cols + col;
         if (range < data.ranges[idx]) {
@@ -296,7 +323,7 @@ RangeImageData BuildRangeImage(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud
     return data;
 }
 
-std::vector<bool> DetectDepthDiscontinuities(
+/*`std::vector<bool> DetectDepthDiscontinuities(
     const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud,
     float depth_threshold = 0.5f) {
     RangeImageMapping cfg;
@@ -334,12 +361,14 @@ std::vector<bool> DetectDepthDiscontinuities(
     }
     return is_edge;
 }
+*/
 
 // 优化版本：接受配准后的点云列表和降采样后的当前点云
 std::vector<double> ComputeTemporalConsistencyOptimized(
     const pcl::PointCloud<pcl::PointXYZI>::Ptr& current_downsampled,
     const std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr>& aligned_frames,
-    double position_threshold = 0.5)  // 位置一致性阈值 (m)
+    double position_threshold = 0.5,  // 位置一致性阈值 (m)
+    double projection_threshold = 0.5)  // 投影一致性阈值 (m, range image)
 {
     std::vector<double> weights;
     weights.reserve(current_downsampled->size());
@@ -372,6 +401,14 @@ std::vector<double> ComputeTemporalConsistencyOptimized(
         hist_kdtrees.push_back(kdtree);
     }
     std::cout << "  KD-Trees built." << std::endl;
+
+    // 预先构建历史帧的球面投影图用于投影一致性评估
+    RangeImageMapping range_cfg;
+    std::vector<RangeImageData> hist_range_images;
+    hist_range_images.reserve(aligned_frames.size());
+    for (const auto& frame : aligned_frames) {
+        hist_range_images.push_back(BuildRangeImage(frame, range_cfg));
+    }
     
     int static_count = 0, dynamic_count = 0;
     int processed = 0;
@@ -380,6 +417,7 @@ std::vector<double> ComputeTemporalConsistencyOptimized(
     for (const auto& p : current_downsampled->points) {
         // 统计该点在历史帧中的出现次数
         int appearance_count = 1;  // 当前帧算一次
+        int projection_consistent = 0;
         
         // 优化3: 使用预先构建的KD-Tree
         for (size_t i = 0; i < hist_kdtrees.size(); ++i) {
@@ -390,10 +428,28 @@ std::vector<double> ComputeTemporalConsistencyOptimized(
                 appearance_count++;
             }
         }
+
+        int row = 0;
+        int col = 0;
+        float range = 0.0f;
+        if (ProjectToRangeImage(p, range_cfg, row, col, range)) {
+            int idx = row * range_cfg.cols + col;
+            for (const auto& range_img : hist_range_images) {
+                if (idx < 0 || idx >= static_cast<int>(range_img.ranges.size())) continue;
+                float hist_range = range_img.ranges[static_cast<size_t>(idx)];
+                if (std::isfinite(hist_range) && std::abs(hist_range - range) < projection_threshold) {
+                    projection_consistent++;
+                }
+            }
+        }
         
         // 计算权重: 出现次数越多，权重越高（表示静态物体）
         // weight = appearance_count / (total_frames + 1)  // +1 是当前帧
-        double weight = static_cast<double>(appearance_count) / (aligned_frames.size() + 1);
+        double appearance_ratio = static_cast<double>(appearance_count) / (aligned_frames.size() + 1);
+        double projection_ratio = aligned_frames.empty()
+            ? 0.0
+            : static_cast<double>(projection_consistent) / aligned_frames.size();
+        double weight = 0.5 * appearance_ratio + 0.5 * projection_ratio;
         weights.push_back(weight);
         
         // 分类统计
@@ -500,6 +556,7 @@ int main(int argc, char** argv) {
     std::vector<double> temporal_weights = ComputeTemporalConsistencyOptimized(
         cloud_ds, 
         fusion_result.aligned_frames, 
+        0.5,
         0.5
     );
 
@@ -561,7 +618,7 @@ int main(int argc, char** argv) {
         if (i < temporal_weights.size()) {
             temporal_weight = temporal_weights[i];
         }
-        if (i < edge_flags.size() && edge_flags[i]) {
+        if (i < depth_edges.edge_flags.size() && depth_edges.edge_flags[i]) {
             temporal_weight = std::min(1.0, temporal_weight * 1.2);
         }
 

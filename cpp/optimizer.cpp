@@ -130,6 +130,39 @@ struct LabelStats {
 // ========================================
 // 工具函数
 // ========================================
+int GetMaxLabel(const cv::Mat& semantic_map) {
+    if (semantic_map.empty()) {
+        return 0;
+    }
+    if (semantic_map.type() == CV_16U || semantic_map.type() == CV_32S) {
+        double min_v = 0.0;
+        double max_v = 0.0;
+        cv::minMaxLoc(semantic_map, &min_v, &max_v);
+        return static_cast<int>(max_v);
+    }
+    if (semantic_map.type() == CV_8U) {
+        return 255;
+    }
+    return 0;
+}
+// 统一的语义图标签读取
+inline int GetSemanticLabel(const cv::Mat& semantic_map, int u, int v) {
+    if (semantic_map.empty()) return 0;
+    if (semantic_map.type() == CV_16U) return semantic_map.at<ushort>(v, u);
+    else if (semantic_map.type() == CV_8U) return semantic_map.at<uchar>(v, u);
+    else if (semantic_map.type() == CV_32S) return semantic_map.at<int>(v, u);
+    return 0;
+}
+
+// 统一的距离图值读取
+inline float GetDistanceValue(const cv::Mat& dist_map, int u, int v) {
+    if (dist_map.empty()) return 1.0f;
+    if (dist_map.type() == CV_16U) return static_cast<float>(dist_map.at<ushort>(v, u)) / 65535.0f;
+    else if (dist_map.type() == CV_32F) return dist_map.at<float>(v, u);
+    else if (dist_map.type() == CV_64F) return static_cast<float>(dist_map.at<double>(v, u));
+    return 1.0f;
+}
+
 bool LoadCalib(const std::string& calib_file, Eigen::Matrix3d& K, Eigen::Matrix3d& R_rect) {
     if (!calib_file.empty() && IOUtils::LoadKittiCalib(calib_file, K)) {
         R_rect = Eigen::Matrix3d::Identity();
@@ -149,20 +182,8 @@ std::vector<LabelStats> ComputeLabelStats(const std::vector<PointFeature>& point
                                         int W, int H,
                                         const Eigen::Matrix3d& R,
                                         const Eigen::Vector3d& t) {
-    int max_label = 0;
-    if (semantic_map.type() == CV_16U) {
-        double min_v = 0.0;
-        double max_v = 0.0;
-        cv::minMaxLoc(semantic_map, &min_v, &max_v);
-        max_label = static_cast<int>(max_v);
-    } else if (semantic_map.type() == CV_8U) {
-        max_label = 255;
-    } else if (semantic_map.type() == CV_32S) {
-        double min_v = 0.0;
-        double max_v = 0.0;
-        cv::minMaxLoc(semantic_map, &min_v, &max_v);
-        max_label = static_cast<int>(max_v);
-    }
+    int max_label = GetMaxLabel(semantic_map);
+    if (max_label <= 0) return std::vector<LabelStats>();
 
     std::vector<double> sum_intensity(max_label + 1, 0.0);
     std::vector<double> sum_intensity_sq(max_label + 1, 0.0);
@@ -172,11 +193,8 @@ std::vector<LabelStats> ComputeLabelStats(const std::vector<PointFeature>& point
     for (const auto& pt : points) {
         int u, v;
         if (!Project(pt.p, K, R, t, u, v, W, H)) continue;
-        int img_label = 0;
-        if (semantic_map.type() == CV_16U) img_label = semantic_map.at<ushort>(v, u);
-        else if (semantic_map.type() == CV_8U) img_label = semantic_map.at<uchar>(v, u);
-        else if (semantic_map.type() == CV_32S) img_label = semantic_map.at<int>(v, u);
 
+        int img_label = GetSemanticLabel(semantic_map, u, v);
         if (img_label <= 0 || img_label > max_label) continue;
         sum_intensity[img_label] += pt.intensity;
         sum_intensity_sq[img_label] += pt.intensity * pt.intensity;
@@ -184,10 +202,11 @@ std::vector<LabelStats> ComputeLabelStats(const std::vector<PointFeature>& point
         if (n.norm() > 1e-6) {
         n.normalize();
         }
-       
+
         sum_normal[img_label] += n;
         counts[img_label] += 1;
     }
+    
 
     std::vector<LabelStats> stats(max_label + 1);
     for (int i = 1; i <= max_label; ++i) {
@@ -205,7 +224,6 @@ std::vector<LabelStats> ComputeLabelStats(const std::vector<PointFeature>& point
 
     return stats;
 }
-
 
 
 bool Project(const Eigen::Vector3d& p_lidar, const Eigen::Matrix3d& K, 
@@ -236,35 +254,47 @@ double GetSemanticCompatibility(int pc_label, int img_label) {
     return 0.0;
 }
 
-double SemanticScore(const std::vector<PointFeature>& points, 
-                     const cv::Mat& semantic_map, 
-                     const Eigen::Matrix3d& K, int W, int H,
-                     const Eigen::Matrix3d& R, const Eigen::Vector3d& t) {
+double MaskIntensityVarianceScore(const std::vector<PointFeature>& points,
+                                    const cv::Mat& semantic_map,
+                                    const Eigen::Matrix3d& K, int W, int H,
+                                    const Eigen::Matrix3d& R, const Eigen::Vector3d& t) {
+    if (semantic_map.empty()) return -1e6;
+
+    int max_label = GetMaxLabel(semantic_map);
+    if (max_label <= 0) return -1e6;
+
+    std::vector<double> sum_intensity(max_label + 1, 0.0);
+    std::vector<double> sum_intensity_sq(max_label + 1, 0.0);
+    std::vector<int> counts(max_label + 1, 0);
     
-    double total_score = 0;
-    int visible_count = 0;
-    
-    for (const auto& pt : points) {
-        if (pt.label == 0) continue; // 只处理有语义的点
-        
+    for (const auto& pt : points) {        
         int u, v;
-        if (Project(pt.p, K, R, t, u, v, W, H)) {
-            int img_label = 0;
-            // 支持 16位 (SegFormer) 和 8位/32位 (旧 Mask)
-            if (semantic_map.type() == CV_16U) img_label = semantic_map.at<ushort>(v, u);
-            else if (semantic_map.type() == CV_8U) img_label = semantic_map.at<uchar>(v, u);
-            else if (semantic_map.type() == CV_32S) img_label = semantic_map.at<int>(v, u);
-            
-            // 使用时空权重加权
-            double weighted_compat = GetSemanticCompatibility(pt.label, img_label) * pt.weight;
-            total_score += weighted_compat;
-            visible_count++;
-        }
+        if (!Project(pt.p, K, R, t, u, v, W, H)) continue;
+
+        int img_label = GetSemanticLabel(semantic_map, u, v);
+
+        if (img_label <= 0 || img_label > max_label) continue;
+        sum_intensity[img_label] += pt.intensity;
+        sum_intensity_sq[img_label] += pt.intensity * pt.intensity;
+        counts[img_label] += 1;
     }
 
-    if (visible_count < 50) return -1e6; // 点太少，结果不可信
-    return total_score;
+    double total_variance = 0.0;
+    int valid_labels = 0;
+    for (int i = 1; i <= max_label; ++i) {
+        if (counts[i] < 10) continue;
+        double mean = sum_intensity[i] / counts[i];
+        double mean_sq = sum_intensity_sq[i] / counts[i];
+        double variance = std::max(0.0, mean_sq - mean * mean);
+        total_variance += variance;
+        valid_labels++;
+    }
+
+    if (valid_labels == 0) return -1e6;
+    return -total_variance;
+
 }
+
 
 // ========================================
 // 边缘吸引场打分 (README2.0 第一阶段 2.3)
@@ -287,26 +317,10 @@ double EdgeAttractionScore(const std::vector<PointFeature>& points,
         }
 
         // 读取距离场值
-        float dist_value = 1.0f;
-        if (dist_map.type() == CV_16U) {
-            dist_value = static_cast<float>(dist_map.at<ushort>(v, u)) / 65535.0f;
-        } else if (dist_map.type() == CV_32F) {
-            dist_value = dist_map.at<float>(v, u);
-        } else if (dist_map.type() == CV_64F) {
-            dist_value = static_cast<float>(dist_map.at<double>(v, u));
-        }
+        float dist_value = GetDistanceValue(dist_map, u, v);
 
         // 读取边缘权重值
-        float edge_weight = 1.0f;
-        if (!weight_map.empty()) {
-            if (weight_map.type() == CV_16U) {
-                edge_weight = static_cast<float>(weight_map.at<ushort>(v, u)) / 65535.0f;
-            } else if (weight_map.type() == CV_32F) {
-                edge_weight = weight_map.at<float>(v, u);
-            } else if (weight_map.type() == CV_64F) {
-                edge_weight = static_cast<float>(weight_map.at<double>(v, u));
-            }
-        }
+        float edge_weight = GetDistanceValue(weight_map, u, v);
 
         dist_value = std::min(std::max(dist_value, 0.0f), 1.0f);
         edge_weight = std::min(std::max(edge_weight, 0.0f), 1.0f);
@@ -440,26 +454,13 @@ struct EdgeConsistencyCost {
 
             double edge_error = 0.0;
             if (dist_map_ && !dist_map_->empty()) {
-                if (dist_map_->type() == CV_16U) {
-                    edge_error = static_cast<double>(dist_map_->at<ushort>(v, u)) / 65535.0;
-                } else if (dist_map_->type() == CV_32F) {
-                    edge_error = static_cast<double>(dist_map_->at<float>(v, u));
-                } else if (dist_map_->type() == CV_64F) {
-                    edge_error = dist_map_->at<double>(v, u);
-                }
+                edge_error = static_cast<double>(GetDistanceValue(*dist_map_, u, v));
                 edge_error = std::min(std::max(edge_error, 0.0), 1.0);
             }
 
             double consistency_error = 0.0;
             if (semantic_map_ && !semantic_map_->empty()) {
-                int img_label = 0;
-                if (semantic_map_->type() == CV_16U) {
-                    img_label = semantic_map_->at<ushort>(v, u);
-                } else if (semantic_map_->type() == CV_8U) {
-                    img_label = semantic_map_->at<uchar>(v, u);
-                } else if (semantic_map_->type() == CV_32S) {
-                    img_label = semantic_map_->at<int>(v, u);
-                }
+                int img_label = GetSemanticLabel(*semantic_map_, u, v);
 
                 if (pt.label != 0 && img_label != pt.label) {
                     consistency_error += 1.0;
@@ -605,14 +606,31 @@ int main(int argc, char** argv) {
     // 2. 粗标定 (Coarse Search)
     // ========================================
     std::cout << "\n[Stage 2] Coarse Calibration (Grid Search)..." << std::endl;
+    
+    // 根据README2.0.md第三阶段要求：优先使用语义方差评分（Calib-Anything逻辑）
+    bool use_semantic = !semantic_map.empty();
+    bool use_edge = !edge_dist.empty();
+    
+    if (use_semantic) {
+        std::cout << "  Strategy: Mask Intensity Variance Minimization (Calib-Anything)" << std::endl;
+    } else if (use_edge) {
+        std::cout << "  Strategy: Edge Attraction Field (EdgeCalib)" << std::endl;
+    } else {
+        std::cerr << "[Error] No scoring method available!" << std::endl;
+        return -1;
+    }
+    
     double best_score = -1e9;
     double best_r[3], best_t[3];
     
-    const double angle_range = 0.15;  // ±8.6度
-    const double angle_step = 0.01;   // ~0.57度
+    const double angle_range = 0.15;  // radians, ±8.6 degrees
+    const double angle_step = 0.01;   // radians, ~0.57 degrees
     int iter = 0;
     const int steps = static_cast<int>(std::floor((2.0 * angle_range) / angle_step)) + 1;
     const int total_iters = steps * steps * steps;
+    
+    std::cout << "  Search space: " << steps << "^3 = " << total_iters << " candidates" << std::endl;
+    std::cout << "  Angle range: ±" << (angle_range * 180.0 / M_PI) << " degrees" << std::endl;
 
     for (double rx = r_curr[0] - angle_range; rx <= r_curr[0] + angle_range + 1e-9; rx += angle_step) {
         for (double ry = r_curr[1] - angle_range; ry <= r_curr[1] + angle_range + 1e-9; ry += angle_step) {
@@ -625,10 +643,14 @@ int main(int argc, char** argv) {
                 ceres::AngleAxisToRotationMatrix(r_try, R_mat.data());
 
                 double score = 0.0;
-                if (!edge_dist.empty()) {
+                if (use_semantic) {
+                    // README2.0.md要求：最大化Mask内强度一致性（方差最小）
+                    score = MaskIntensityVarianceScore(points, semantic_map, K, W, H, R_mat, t_vec);
+                } else if (use_edge) {
+                    // 备用方案：边缘吸引场
                     score = EdgeAttractionScore(points, edge_dist, edge_weight, K, W, H, R_mat, t_vec);
-                } else {
-                    score = SemanticScore(points, semantic_map, K, W, H, R_mat, t_vec);
+                }else{
+                    score = -1e6;
                 }
 
                 if (score > best_score) {
@@ -639,15 +661,14 @@ int main(int argc, char** argv) {
 
                 iter++;
                 if (iter % 200 == 0) {
-                    std::cout << "  Iter " << iter << "/" << total_iters
-                              << ", Best Score: " << best_score << std::endl;
+                    std::cout << "  Progress: " << iter << "/" << total_iters
+                              << " (" << (iter * 100 / total_iters) << "%), Best Score: " << best_score << std::endl;
                 }
             }
-    
         }
     }
     
-    std::cout << "Coarse Search Complete. Best Score: " << best_score << std::endl;
+    std::cout << "  Coarse Search Complete. Best Score: " << best_score << std::endl;
     std::cout << "  R: [" << best_r[0] << ", " << best_r[1] << ", " << best_r[2] << "]" << std::endl;
     std::cout << "  T: [" << best_t[0] << ", " << best_t[1] << ", " << best_t[2] << "]" << std::endl;
     
@@ -655,21 +676,25 @@ int main(int argc, char** argv) {
     std::copy(best_t, best_t+3, t_curr);
 
     // ========================================
-    // 3. 精细优化 (Fine Refinement)
+    // 3. 精细优化 (Fine Refinement) - README2.0.md 第三阶段
     // ========================================
     if (!edge_dist.empty() || !semantic_map.empty()) {
-        std::cout << "\n[Stage 3] Fine Calibration (Ceres Optimization)..." << std::endl;
+        std::cout << "\n[Stage 3] Fine Calibration (Ceres LM Optimization)..." << std::endl;
         ceres::Problem problem;
         
+        // 采样点云以提高效率（最多5000个点）
         std::vector<int> sample_indices;
         sample_indices.reserve(points.size());
         const int stride = std::max<int>(1, static_cast<int>(points.size() / 5000));
         for (size_t i = 0; i < points.size(); i += stride) {
             sample_indices.push_back(static_cast<int>(i));
         }
+        std::cout << "  Sampled " << sample_indices.size() << " points from " << points.size() << " total points" << std::endl;
 
-        const double w_edge = 1.0;
-        const double w_consistency = 1.0;
+        // 混合Loss权重：α * E_geo + β * E_sem (README2.0.md公式)
+        const double w_edge = 1.0;         // α: 几何误差权重
+        const double w_consistency = 1.0;  // β: 语义一致性权重
+        std::cout << "  Loss weights: w_edge=" << w_edge << ", w_consistency=" << w_consistency << std::endl;
         std::vector<LabelStats> label_stats;
         if (!semantic_map.empty()) {
             Eigen::Vector3d t_vec(t_curr[0], t_curr[1], t_curr[2]);
@@ -775,13 +800,6 @@ int main(int argc, char** argv) {
             output_file.replace(pos, 14, "calibration");
         }
     }
-    //std::string output_file = lidar_base + "_calib_result.txt";
-    
-    // 替换lidar_features为calibration
-    //size_t pos = output_file.find("lidar_features");
-    //if (pos != std::string::npos) {
-        //output_file.replace(pos, 14, "calibration");
-   // }
     
     std::ofstream result_file(output_file);
     if (result_file.is_open()) {
